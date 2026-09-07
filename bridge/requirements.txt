@@ -1,0 +1,5 @@
+-r ../requirements.txt
+
+fastapi==0.136.1
+pydantic==2.12.4
+uvicorn[standard]==0.46.0

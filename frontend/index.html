@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kwipu — Second Brain</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <aside id="panel">
+      <header class="brand">
+        <h1>Kwipu</h1>
+        <span class="subtitle">Second Brain · 3D</span>
+      </header>
+
+      <div id="stats" class="stats">loading…</div>
+
+      <section class="ask">
+        <textarea id="q" rows="2" placeholder="ask your notes&hellip;"></textarea>
+        <button id="ask">Ask</button>
+        <div id="ask-status" class="ask-status"></div>
+      </section>
+
+      <section class="answer" id="answer-box" hidden>
+        <div class="answer-label">Answer</div>
+        <div id="answer" class="answer-text"></div>
+        <div id="cited" class="cited"></div>
+        <button id="clear-highlight" class="link-btn">clear focus</button>
+      </section>
+
+      <section class="controls">
+        <div class="group-label">View</div>
+        <label>
+          <input type="checkbox" id="opt-chunks" checked />
+          include source chunks
+        </label>
+        <label>
+          <input type="checkbox" id="opt-noisy" checked />
+          drop noisy entities
+        </label>
+        <div class="range-row">
+          <div class="head">
+            <span>min degree</span>
+            <span class="v" id="opt-mindeg-val">0</span>
+          </div>
+          <input type="range" id="opt-mindeg" min="0" max="6" value="0" />
+        </div>
+        <button id="reload">Reload graph</button>
+      </section>
+
+      <div id="hover" class="hover"><div class="empty">hover a node…</div></div>
+    </aside>
+
+    <main id="graph"></main>
+    <div class="scene-meta" id="scene-meta"></div>
+
+    <section class="preview" id="preview" hidden>
+      <header class="preview-head">
+        <div>
+          <div class="preview-label">Source</div>
+          <div class="preview-title" id="preview-title"></div>
+        </div>
+        <button class="preview-close" id="preview-close" aria-label="close">×</button>
+      </header>
+      <div class="preview-body" id="preview-body"></div>
+    </section>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

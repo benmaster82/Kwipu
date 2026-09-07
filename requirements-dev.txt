@@ -1,0 +1,3 @@
+-r bridge/requirements.txt
+
+httpx==0.28.1

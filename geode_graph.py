@@ -9,11 +9,14 @@ if sys.platform == "win32" and os.environ.get("PYTHONUTF8") != "1":
     result = subprocess.run([sys.executable] + sys.argv, env=os.environ)
     sys.exit(result.returncode)
 
+import csv
 import hashlib
 import io
 import math
 import re
+import shutil
 import time
+import uuid
 import yaml
 import logging
 import threading
@@ -72,6 +75,29 @@ from llama_index.core.schema import NodeWithScore, TextNode, Document
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 
+from kwipu_config import (
+    EMBED_MODEL,
+    HASH_CACHE_FILE,
+    KNOWLEDGE_DIR,
+    MODEL_NAME,
+    OLLAMA_BASE_URL,
+    OLLAMA_TIMEOUT,
+    QUERY_MAX_LENGTH,
+    STORAGE_DIR,
+    STORAGE_LOCK_FILE,
+    STORAGE_LOCK_TIMEOUT,
+    STORAGE_MANIFEST_FILE,
+    validate_storage_layout,
+)
+from kwipu_storage import (
+    InterProcessFileLock,
+    _fsync_directory,
+    atomic_write_json,
+    atomic_write_json_locked,
+    read_json,
+    read_json_locked,
+)
+
 # Multilingual module
 from lang_config import (
     tokenize,
@@ -85,25 +111,114 @@ from lang_config import (
 # ==========================================
 # CONFIGURATION
 # ==========================================
-MODEL_NAME = "gpt-oss:20b-cloud"
-EMBED_MODEL = "nomic-embed-text"
-KNOWLEDGE_DIR = "./knowledge_base"
-STORAGE_DIR = "./storage_graph"
-
 WATCHER_DEBOUNCE_SECONDS = 5
 WATCHER_VALID_EXTENSIONS = {".md", ".txt", ".pdf", ".docx"}
+_WATCHER_EVENT_PRIORITY = {"created": 1, "modified": 2, "deleted": 3}
 
 logging.basicConfig(level=logging.ERROR)
 
 
-def _init_llm(model_name: str = MODEL_NAME, embed_model: str = EMBED_MODEL):
-    """Initialize LLM and embedding model. Called from main() to avoid side effects on import."""
+class EmbeddingModelMismatchError(RuntimeError):
+    """Stored vectors were created with a different embedding model."""
+
+
+class QueryValidationError(ValueError):
+    """A knowledge-graph query is empty or exceeds the configured limit."""
+
+
+class PersistedIndexUnavailableError(RuntimeError):
+    """A read-only consumer could not load a complete persisted index."""
+
+
+class StoragePublishError(RuntimeError):
+    """A prepared storage generation could not be published safely."""
+
+
+def validate_question(question: str) -> str:
+    """Validate and normalize a query before any model or index initialization."""
+    if not isinstance(question, str):
+        raise QueryValidationError("Question must be a string.")
+    normalized = question.strip()
+    if not normalized:
+        raise QueryValidationError("Question must not be empty.")
+    if len(normalized) > QUERY_MAX_LENGTH:
+        raise QueryValidationError(
+            f"Question is too long: maximum length is {QUERY_MAX_LENGTH} characters."
+        )
+    return normalized
+
+
+_TRIPLET_BULLET_RE = re.compile(r"^(?:(?:[-*+])|(?:\d+[.)]))\s*")
+_TRIPLET_LABEL_RE = re.compile(r"^triplet\s*:\s*", re.IGNORECASE)
+_TRIPLET_WRAPPERS = {"(": ")", "[": "]", "{": "}"}
+
+
+def parse_llm_triplets(
+    response_str: str, max_length: int = 128
+) -> list[tuple[str, str, str]]:
+    """Parse CSV triplets emitted by the LLM without changing their casing.
+
+    Each non-empty line may have a Markdown bullet, a ``Triplet:`` label, and
+    one outer pair of brackets. Quoted CSV fields may contain commas. Malformed
+    rows, empty fields, and fields over the UTF-8 byte limit are discarded.
+    Exact duplicate triplets are returned only once.
+    """
+    if not isinstance(response_str, str) or max_length <= 0:
+        return []
+
+    results: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw_line in response_str.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("```"):
+            continue
+        line = _TRIPLET_BULLET_RE.sub("", line, count=1).strip()
+        line = _TRIPLET_LABEL_RE.sub("", line, count=1).strip()
+        if len(line) >= 2 and line[0] == "`" and line[-1] == "`":
+            line = line[1:-1].strip()
+        if len(line) >= 2 and _TRIPLET_WRAPPERS.get(line[0]) == line[-1]:
+            line = line[1:-1].strip()
+        if not line:
+            continue
+
+        try:
+            rows = list(csv.reader([line], skipinitialspace=True, strict=True))
+        except csv.Error:
+            continue
+        if len(rows) != 1 or len(rows[0]) != 3:
+            continue
+
+        triplet = tuple(field.strip() for field in rows[0])
+        if any(
+            not field or len(field.encode("utf-8")) > max_length
+            for field in triplet
+        ):
+            continue
+        typed_triplet = (triplet[0], triplet[1], triplet[2])
+        if typed_triplet in seen:
+            continue
+        seen.add(typed_triplet)
+        results.append(typed_triplet)
+    return results
+
+
+def _init_llm(
+    model_name: str = MODEL_NAME,
+    embed_model: str = EMBED_MODEL,
+    base_url: str = OLLAMA_BASE_URL,
+    request_timeout: float = OLLAMA_TIMEOUT,
+):
+    """Initialize LLM and embedding model without doing network I/O."""
     Settings.llm = Ollama(
         model=model_name,
-        request_timeout=300.0,
-        base_url="http://localhost:11434",
+        request_timeout=request_timeout,
+        base_url=base_url,
     )
-    Settings.embed_model = OllamaEmbedding(model_name=embed_model)
+    Settings.embed_model = OllamaEmbedding(
+        model_name=embed_model,
+        base_url=base_url,
+        client_kwargs={"timeout": request_timeout},
+    )
 
     # Chunking: large chunks to avoid splitting small notes
     Settings.chunk_size = 2048
@@ -338,29 +453,44 @@ class TemporalMetadataRetriever(CustomPGRetriever):
 # READ-WRITE LOCK
 # ==========================================
 class ReadWriteLock:
-    """Lock that allows concurrent reads but exclusive writes."""
+    """Writer-preference lock with concurrent readers and exclusive writers."""
 
     def __init__(self):
-        self._read_ready = threading.Condition(threading.Lock())
+        self._condition = threading.Condition()
         self._readers = 0
+        self._writer_active = False
+        self._waiting_writers = 0
 
     def acquire_read(self):
-        with self._read_ready:
+        with self._condition:
+            while self._writer_active or self._waiting_writers > 0:
+                self._condition.wait()
             self._readers += 1
 
     def release_read(self):
-        with self._read_ready:
+        with self._condition:
+            if self._readers <= 0:
+                raise RuntimeError("Cannot release an unacquired read lock.")
             self._readers -= 1
             if self._readers == 0:
-                self._read_ready.notify_all()
+                self._condition.notify_all()
 
     def acquire_write(self):
-        self._read_ready.acquire()
-        while self._readers > 0:
-            self._read_ready.wait()
+        with self._condition:
+            self._waiting_writers += 1
+            try:
+                while self._writer_active or self._readers > 0:
+                    self._condition.wait()
+                self._writer_active = True
+            finally:
+                self._waiting_writers -= 1
 
     def release_write(self):
-        self._read_ready.release()
+        with self._condition:
+            if not self._writer_active:
+                raise RuntimeError("Cannot release an unacquired write lock.")
+            self._writer_active = False
+            self._condition.notify_all()
 
 
 # ==========================================
@@ -569,184 +699,475 @@ class WritHerGraphRAG:
         fast_mode: bool = False,
         model_name: str = MODEL_NAME,
         embed_model: str = EMBED_MODEL,
+        build_if_missing: bool = True,
     ) -> None:
         self.index = None
         self._rw_lock = ReadWriteLock()
+        self._async_query_lock = asyncio.Lock()
         self._query_engine = None
         self._retrievers_dirty = True
         self._fast_mode = fast_mode
+        self._build_if_missing = build_if_missing
+        self._storage_revision: str | None = None
         self.model_name = model_name
         self.embed_model = embed_model
-        if not os.path.exists(KNOWLEDGE_DIR):
-            os.makedirs(KNOWLEDGE_DIR)
+        # Validate every managed generation before the first mkdir. The same
+        # helper runs at import time and again here so patched/runtime paths
+        # cannot bypass the source-vault safety invariant.
+        self._storage_paths()
+        os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
         self.load_or_build_index()
 
+    @staticmethod
+    def _storage_paths() -> tuple[Path, Path, Path]:
+        return validate_storage_layout(KNOWLEDGE_DIR, STORAGE_DIR)
+
+    @staticmethod
+    def _storage_lock() -> InterProcessFileLock:
+        return InterProcessFileLock(STORAGE_LOCK_FILE, STORAGE_LOCK_TIMEOUT)
+
+    @staticmethod
+    def _has_persisted_storage() -> bool:
+        if not os.path.isdir(STORAGE_DIR):
+            return False
+        metadata_only = {
+            ".file_hashes.json",
+            ".kwipu_meta.json",
+            ".kwipu_restore_backup",
+        }
+        return any(name not in metadata_only for name in os.listdir(STORAGE_DIR))
+
+    @staticmethod
+    def _read_storage_manifest_unlocked() -> dict | None:
+        manifest_path = Path(STORAGE_MANIFEST_FILE)
+        if not manifest_path.exists():
+            return None
+
+        invalid = object()
+        manifest = read_json(manifest_path, default=invalid)
+        if isinstance(manifest, dict):
+            return manifest
+        # A writer swaps the active directory before a lock-free reader can
+        # finish this probe. Treat that brief absence as an in-progress commit
+        # instead of interrupting an otherwise usable in-memory index.
+        if not manifest_path.exists():
+            return None
+        manifest = read_json(manifest_path, default=invalid)
+        if isinstance(manifest, dict):
+            return manifest
+        if not manifest_path.exists():
+            return None
+        raise PersistedIndexUnavailableError(
+            "Persisted knowledge-graph manifest is invalid or unreadable."
+        )
+
+    @classmethod
+    def _read_storage_revision_unlocked(cls) -> str | None:
+        manifest = cls._read_storage_manifest_unlocked()
+        revision = manifest.get("storage_revision") if manifest else None
+        return revision if isinstance(revision, str) and revision else None
+
+    def _load_index_unlocked(self):
+        """Load the latest persisted index. Caller owns both write locks."""
+        manifest = self._check_storage_compatibility()
+        safe_print("Loading knowledge graph from local storage...")
+        storage_context = StorageContext.from_defaults(persist_dir=STORAGE_DIR)
+        self.index = load_index_from_storage(storage_context)
+        revision = manifest.get("storage_revision") if manifest else None
+        self._storage_revision = (
+            revision if isinstance(revision, str) and revision else None
+        )
+        safe_print("Graph loaded successfully.")
+
+    def _load_empty_generation_unlocked(self) -> bool:
+        """Load the revision of a committed generation that has no index."""
+        current, _, _ = self._storage_paths()
+        if not self._generation_is_valid(current):
+            return False
+        manifest = self._read_storage_manifest_unlocked()
+        if not isinstance(manifest, dict) or manifest.get("has_index") is not False:
+            return False
+        self._check_storage_compatibility()
+        self.index = None
+        revision = manifest.get("storage_revision")
+        self._storage_revision = (
+            revision if isinstance(revision, str) and revision else None
+        )
+        return True
+
     def load_or_build_index(self):
-        """Load existing graph or build a new one."""
+        """Load storage, or build it only when this instance is a writer."""
         self._rw_lock.acquire_write()
         try:
-            try:
-                if os.path.exists(STORAGE_DIR) and os.listdir(STORAGE_DIR):
-                    # P1.4: Check embed model compatibility
-                    self._check_storage_compatibility()
-                    safe_print("Loading knowledge graph from local storage...")
-                    storage_context = StorageContext.from_defaults(
-                        persist_dir=STORAGE_DIR
-                    )
-                    self.index = load_index_from_storage(storage_context)
-                    safe_print("Graph loaded successfully.")
-                else:
+            with self._storage_lock():
+                self._recover_storage_unlocked()
+                if self._load_empty_generation_unlocked():
+                    pass
+                elif not self._has_persisted_storage():
+                    if not self._build_if_missing:
+                        raise PersistedIndexUnavailableError(
+                            "Persisted knowledge-graph index is not available."
+                        )
                     self._build_index_unlocked()
-            except Exception as e:
-                safe_print(f"Load error: {e}. Rebuilding index...")
-                self._build_index_unlocked()
-            self._retrievers_dirty = True
+                else:
+                    try:
+                        self._load_index_unlocked()
+                    except EmbeddingModelMismatchError:
+                        raise
+                    except Exception as exc:
+                        if not self._build_if_missing:
+                            raise PersistedIndexUnavailableError(
+                                "Persisted knowledge-graph index could not be loaded."
+                            ) from exc
+                        safe_print(f"Load error: {exc}. Rebuilding index...")
+                        self._build_index_unlocked()
+                self._query_engine = None
+                self._retrievers_dirty = True
         finally:
             self._rw_lock.release_write()
 
-    def _check_storage_compatibility(self):
-        """Verify that stored graph was built with the same embedding model.
-
-        Raises RuntimeError if embed model mismatch is detected.
-        """
-        import json as _json
-
-        meta_path = os.path.join(STORAGE_DIR, ".kwipu_meta.json")
-        if not os.path.exists(meta_path):
-            return  # Legacy storage without manifest, allow loading
-
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = _json.load(f)
-        except (OSError, _json.JSONDecodeError):
-            return
+    def _check_storage_compatibility(self) -> dict | None:
+        """Raise a dedicated error if stored and configured embeddings differ."""
+        meta = self._read_storage_manifest_unlocked()
+        if not isinstance(meta, dict):
+            return None  # Legacy storage without a readable manifest
 
         stored_embed = meta.get("embed_model", "")
-        current_embed = self.embed_model
-
-        if stored_embed and stored_embed != current_embed:
-            raise RuntimeError(
+        if stored_embed and stored_embed != self.embed_model:
+            raise EmbeddingModelMismatchError(
                 f"Embedding model mismatch: storage was built with '{stored_embed}' "
-                f"but current config uses '{current_embed}'. "
-                f"Delete '{STORAGE_DIR}/' to rebuild, or restore the previous model."
+                f"but current config uses '{self.embed_model}'. "
+                f"Delete '{STORAGE_DIR}' to rebuild it, or restore the previous model."
             )
 
-        # LLM model change is fine (only used for generation, not embeddings)
+        # An LLM change is safe because it does not alter stored vectors.
         stored_llm = meta.get("llm_model", "")
         if stored_llm and stored_llm != self.model_name:
             safe_print(
                 f"[dim]Note: graph was built with '{stored_llm}', "
                 f"now using '{self.model_name}' for queries.[/dim]"
             )
+        return meta
 
-    def _save_storage_manifest(self):
-        """Save metadata about the current build configuration."""
-        import json as _json
+    @staticmethod
+    def _generation_manifest_path(directory: Path) -> Path:
+        return directory / Path(STORAGE_MANIFEST_FILE).name
 
-        meta_path = os.path.join(STORAGE_DIR, ".kwipu_meta.json")
-        meta = {
-            "embed_model": self.embed_model,
-            "llm_model": self.model_name,
-            "version": "1.0",
+    @staticmethod
+    def _generation_hash_path(directory: Path) -> Path:
+        return directory / Path(HASH_CACHE_FILE).name
+
+    @classmethod
+    def _generation_is_valid(cls, directory: Path) -> bool:
+        """Return whether a directory is a complete committed/legacy generation."""
+        if not directory.is_dir():
+            return False
+        metadata_only = {
+            Path(HASH_CACHE_FILE).name,
+            Path(STORAGE_MANIFEST_FILE).name,
+            ".kwipu_restore_backup",
         }
+        manifest_path = cls._generation_manifest_path(directory)
+        if manifest_path.exists():
+            manifest = read_json(manifest_path, default=None)
+            if not (
+                isinstance(manifest, dict)
+                and isinstance(manifest.get("storage_revision"), str)
+                and manifest["storage_revision"]
+            ):
+                return False
+
+            has_index = manifest.get("has_index")
+            if has_index is False:
+                return isinstance(
+                    read_json(cls._generation_hash_path(directory), default=None),
+                    dict,
+                )
+            if has_index not in (True, None):
+                return False
+            try:
+                return any(
+                    item.name not in metadata_only for item in directory.iterdir()
+                )
+            except OSError:
+                return False
+
+        # Legacy generations have no manifest but must contain index payload.
         try:
-            with open(meta_path, "w", encoding="utf-8") as f:
-                _json.dump(meta, f, indent=2)
+            return any(item.name not in metadata_only for item in directory.iterdir())
         except OSError:
+            return False
+
+    @classmethod
+    def _remove_generation_unlocked(cls, directory: Path) -> None:
+        """Remove only a validated managed generation, never the source vault."""
+        current, staging, backup = cls._storage_paths()
+        directory = directory.resolve(strict=False)
+        if directory not in {current, staging, backup}:
+            raise ValueError(f"Refusing to remove unmanaged path '{directory}'")
+        if not directory.exists() and not directory.is_symlink():
+            return
+        is_junction = getattr(directory, "is_junction", lambda: False)()
+        if directory.is_symlink() or is_junction or not directory.is_dir():
+            if is_junction and directory.is_dir():
+                directory.rmdir()
+            else:
+                directory.unlink(missing_ok=True)
+            return
+        shutil.rmtree(directory)
+
+    @classmethod
+    def _recover_storage_unlocked(cls) -> None:
+        """Resolve deterministic crash states while holding the storage lock."""
+        current, staging, backup = cls._storage_paths()
+        current_valid = cls._generation_is_valid(current)
+        backup_valid = cls._generation_is_valid(backup)
+        backup_restore_marker = backup / ".kwipu_restore_backup"
+
+        # A marker in backup means publication never cleared its rollback
+        # intent. Prefer the last known-good generation even if the candidate
+        # currently occupying ``current`` is structurally valid.
+        if backup_restore_marker.is_file():
+            if not backup_valid:
+                raise PersistedIndexUnavailableError(
+                    "Persisted rollback backup is invalid or incomplete."
+                )
+            if current.exists():
+                cls._remove_generation_unlocked(current)
+            os.replace(backup, current)
+            (current / backup_restore_marker.name).unlink(missing_ok=True)
+            _fsync_directory(current)
+            _fsync_directory(current.parent)
+            cls._remove_generation_unlocked(staging)
+            return
+
+        if current.exists():
+            if current_valid:
+                cls._remove_generation_unlocked(backup)
+            elif backup_valid:
+                cls._remove_generation_unlocked(current)
+                os.replace(backup, current)
+                _fsync_directory(current.parent)
+            elif backup.exists():
+                cls._remove_generation_unlocked(backup)
+        elif backup.exists():
+            if backup_valid:
+                os.replace(backup, current)
+                _fsync_directory(current.parent)
+            else:
+                cls._remove_generation_unlocked(backup)
+
+        # A staging directory is never committed: only the staging->current
+        # rename commits it. Therefore every surviving staging path is stale.
+        cls._remove_generation_unlocked(staging)
+
+    def _write_staging_manifest_unlocked(
+        self, staging: Path, *, has_index: bool
+    ) -> str:
+        """Write the staging commit marker without changing in-memory revision."""
+        revision = str(uuid.uuid4())
+        atomic_write_json(
+            self._generation_manifest_path(staging),
+            {
+                "embed_model": self.embed_model,
+                "llm_model": self.model_name,
+                "storage_revision": revision,
+                "has_index": has_index,
+                "version": "1.0",
+            },
+        )
+        return revision
+
+    @staticmethod
+    def _fsync_generation_unlocked(directory: Path) -> None:
+        """Flush every prepared regular file before writing the manifest marker."""
+        for path in directory.rglob("*"):
+            if not path.is_file() or path.is_symlink():
+                continue
+            with path.open("r+b") as handle:
+                os.fsync(handle.fileno())
+        _fsync_directory(directory)
+
+    def _commit_staging_unlocked(self, staging: Path, revision: str) -> None:
+        """Durably publish staging and roll back if either swap cannot commit."""
+        current, expected_staging, backup = self._storage_paths()
+        if staging.resolve(strict=False) != expected_staging:
+            raise ValueError("Unexpected staging path")
+        if not self._generation_is_valid(staging):
+            raise StoragePublishError("Staging generation is incomplete")
+        if backup.exists():
+            raise StoragePublishError(
+                "Storage backup must be recovered before publishing a generation"
+            )
+
+        moved_current = False
+        published_current = False
+        backup_restore_marker = backup / ".kwipu_restore_backup"
+        try:
+            if current.exists():
+                os.replace(current, backup)
+                moved_current = True
+                _fsync_directory(current.parent)
+                # Until publication and its directory flush complete, backup
+                # remains authoritative. Recovery uses this durable intent if
+                # rollback itself is interrupted or fails.
+                atomic_write_json(
+                    backup_restore_marker,
+                    {"restore_backup": True, "version": "1.0"},
+                )
+            os.replace(staging, current)
+            published_current = True
+            # The rename is not committed durably until its parent directory is
+            # flushed. Keep backup and the old in-memory revision until then.
+            _fsync_directory(current.parent)
+            if moved_current:
+                backup_restore_marker.unlink(missing_ok=True)
+                _fsync_directory(backup)
+        except BaseException:
+            if published_current and current.exists():
+                try:
+                    os.replace(current, staging)
+                    published_current = False
+                except OSError:
+                    # The durable marker keeps backup authoritative when the
+                    # candidate cannot be moved back to staging.
+                    pass
+            if moved_current and not current.exists() and backup.exists():
+                try:
+                    os.replace(backup, current)
+                    (current / backup_restore_marker.name).unlink(missing_ok=True)
+                    _fsync_directory(current)
+                    _fsync_directory(current.parent)
+                except OSError:
+                    # The marked backup remains recoverable on the next lock acquisition.
+                    pass
+            raise
+
+        # Only the durable staging->current rename and cleared rollback intent
+        # advance the in-memory revision.
+        self._storage_revision = revision
+        try:
+            self._remove_generation_unlocked(backup)
+        except OSError:
+            # A post-commit cleanup failure is recovered on the next transaction.
             pass
 
+    def _publish_generation_unlocked(self, index) -> str:
+        """Persist a complete generation in staging, then publish it by swap."""
+        current, staging, _ = self._storage_paths()
+        try:
+            self._remove_generation_unlocked(staging)
+            staging.mkdir(parents=False, exist_ok=False)
+
+            if index is not None:
+                index.storage_context.persist(persist_dir=str(staging))
+
+            hashes = read_json(
+                self._generation_hash_path(current), default={}
+            )
+            if not isinstance(hashes, dict):
+                hashes = {}
+            atomic_write_json(self._generation_hash_path(staging), hashes)
+            self._fsync_generation_unlocked(staging)
+            revision = self._write_staging_manifest_unlocked(
+                staging, has_index=index is not None
+            )
+            self._commit_staging_unlocked(staging, revision)
+            return revision
+        except BaseException as exc:
+            try:
+                self._remove_generation_unlocked(staging)
+            except OSError:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, StoragePublishError):
+                raise
+            raise StoragePublishError(
+                "Storage generation could not be published; the previous generation "
+                "was preserved."
+            ) from exc
+
     def build_index(self):
-        """Rebuild the graph (thread-safe with write lock)."""
+        """Rebuild the graph under one local and inter-process transaction."""
         self._rw_lock.acquire_write()
         try:
-            self._build_index_unlocked()
-            self._retrievers_dirty = True
+            with self._storage_lock():
+                self._recover_storage_unlocked()
+                self._build_index_unlocked()
+                self._retrievers_dirty = True
         finally:
             self._rw_lock.release_write()
 
     def insert_document(self, file_path):
-        """Insert a single document into the existing graph (incremental)."""
+        """Insert one new document after reloading the latest persisted index."""
+        file_path = str(Path(file_path).resolve())
         self._rw_lock.acquire_write()
         try:
-            if not self.index:
-                self._build_index_unlocked()
-                self._retrievers_dirty = True
-                return
+            with self._storage_lock():
+                self._recover_storage_unlocked()
+                try:
+                    # Another process may have persisted changes since this instance loaded.
+                    if self._has_persisted_storage():
+                        self._load_index_unlocked()
+                    elif not self.index:
+                        self._build_index_unlocked()
+                        self._retrievers_dirty = True
+                        return
 
-            try:
-                reader = SimpleDirectoryReader(
-                    input_files=[file_path], filename_as_id=True
-                )
-                docs = reader.load_data()
-                if docs:
-                    enriched_docs, structural_triples = enrich_documents(docs)
-                    for doc in enriched_docs:
-                        safe_print(
-                            f"Incremental insert: {os.path.basename(file_path)}..."
+                    reader = SimpleDirectoryReader(
+                        input_files=[file_path], filename_as_id=True
+                    )
+                    docs = reader.load_data()
+                    if docs:
+                        enriched_docs, structural_triples = enrich_documents(docs)
+                        for doc in enriched_docs:
+                            safe_print(
+                                f"Incremental insert: {os.path.basename(file_path)}..."
+                            )
+                            self.index.insert(doc)
+                        self._inject_structural_triples(
+                            structural_triples, index=self.index
                         )
-                        self.index.insert(doc)
-                    self._inject_structural_triples(structural_triples)
-                    self.index.storage_context.persist(persist_dir=STORAGE_DIR)
-                    safe_print("Document added to graph successfully.")
+                        self._publish_generation_unlocked(self.index)
+                        safe_print("Document added to graph successfully.")
+                        self._retrievers_dirty = True
+                except EmbeddingModelMismatchError:
+                    raise
+                except StoragePublishError as exc:
+                    safe_print(f"Incremental insert publish error: {exc}")
+                    self._recover_storage_unlocked()
+                    if self._has_persisted_storage():
+                        self._load_index_unlocked()
+                    else:
+                        self.index = None
+                        self._storage_revision = self._read_storage_revision_unlocked()
+                    self._query_engine = None
                     self._retrievers_dirty = True
-            except Exception as e:
-                safe_print(
-                    f"Incremental insert error: {e}. Full rebuild..."
-                )
-                self._build_index_unlocked()
-                self._retrievers_dirty = True
+                    # The caller must not checkpoint this source as indexed when
+                    # publication failed. Recovery above restores the active
+                    # in-memory generation; propagating preserves watcher state.
+                    raise
+                except Exception as exc:
+                    safe_print(f"Incremental insert error: {exc}. Full rebuild...")
+                    self._build_index_unlocked()
+                    self._retrievers_dirty = True
         finally:
             self._rw_lock.release_write()
 
     def update_document(self, file_path):
-        """Update a modified document in the graph (delete + re-insert).
+        """Compatibility API: modifications require a full rebuild for correctness."""
+        safe_print(f"Modified file detected: {os.path.basename(file_path)}.")
+        self.build_index()
 
-        More efficient than a full rebuild for single-file modifications.
-        Falls back to full rebuild if the incremental update fails.
-        """
-        self._rw_lock.acquire_write()
-        try:
-            if not self.index:
-                self._build_index_unlocked()
-                self._retrievers_dirty = True
-                return
-
-            try:
-                # The ref_doc_id is the file path (set by filename_as_id=True)
-                ref_doc_id = file_path
-                safe_print(f"Updating: {os.path.basename(file_path)}...")
-
-                # Step 1: Remove old version from graph
-                self.index.delete_ref_doc(ref_doc_id, delete_from_docstore=True)
-
-                # Step 2: Re-read and insert updated version
-                reader = SimpleDirectoryReader(
-                    input_files=[file_path], filename_as_id=True
-                )
-                docs = reader.load_data()
-                if docs:
-                    enriched_docs, structural_triples = enrich_documents(docs)
-                    for doc in enriched_docs:
-                        self.index.insert(doc)
-                    self._inject_structural_triples(structural_triples)
-
-                self.index.storage_context.persist(persist_dir=STORAGE_DIR)
-                safe_print("Document updated successfully.")
-                self._retrievers_dirty = True
-            except Exception as e:
-                safe_print(
-                    f"Incremental update error: {e}. Full rebuild..."
-                )
-                self._build_index_unlocked()
-                self._retrievers_dirty = True
-        finally:
-            self._rw_lock.release_write()
-
-    def _inject_structural_triples(self, triples: list[tuple[str, str, str]]):
-        """Inject pre-extracted triples into the property graph."""
-        if not self.index or not triples:
+    def _inject_structural_triples(
+        self, triples: list[tuple[str, str, str]], *, index=None
+    ):
+        """Inject pre-extracted triples into the selected property graph."""
+        target_index = self.index if index is None else index
+        if not target_index or not triples:
             return
-        graph_store = self.index.property_graph_store
+        graph_store = target_index.property_graph_store
         for subj, rel, obj in triples:
             try:
                 graph_store.upsert_triplet(subj, rel, obj)
@@ -767,7 +1188,9 @@ class WritHerGraphRAG:
 
         if not documents:
             safe_print("No files found. Waiting for documents...")
+            self._publish_generation_unlocked(None)
             self.index = None
+            self._query_engine = None
             return
 
         # Time estimate for user feedback
@@ -795,27 +1218,6 @@ class WritHerGraphRAG:
             f"LLM extraction and graph construction with {self.model_name}..."
         )
 
-        def parse_triplets(response_str, max_length=128):
-            results = []
-            for line in response_str.strip().split("\n"):
-                line = line.strip().strip("-").strip("*").strip()
-                if not line:
-                    continue
-                if "(" in line and ")" in line:
-                    line = line[line.index("(") + 1 : line.index(")")]
-                tokens = line.split(",")
-                if len(tokens) != 3:
-                    continue
-                subj, pred, obj = (t.strip().strip('"') for t in tokens)
-                if not subj or not pred or not obj:
-                    continue
-                if any(len(s.encode("utf-8")) > max_length for s in [subj, pred, obj]):
-                    continue
-                results.append(
-                    (subj.capitalize(), pred.capitalize(), obj.capitalize())
-                )
-            return results
-
         kg_extractors = [
             SimpleLLMPathExtractor(
                 llm=Settings.llm,
@@ -830,22 +1232,24 @@ class WritHerGraphRAG:
                     "Text: {text}\n"
                     "Triplets:\n"
                 ),
-                parse_fn=parse_triplets,
+                parse_fn=parse_llm_triplets,
                 num_workers=1,
                 max_paths_per_chunk=20,
             ),
             ImplicitPathExtractor(),
         ]
 
-        self.index = PropertyGraphIndex.from_documents(
+        new_index = PropertyGraphIndex.from_documents(
             enriched_docs, kg_extractors=kg_extractors, show_progress=False
         )
 
         safe_print("Injecting structural relations into graph...")
-        self._inject_structural_triples(structural_triples)
+        self._inject_structural_triples(structural_triples, index=new_index)
 
-        self.index.storage_context.persist(persist_dir=STORAGE_DIR)
-        self._save_storage_manifest()
+        # The candidate remains detached from the active in-memory and on-disk
+        # generations until the complete staging directory is committed.
+        self._publish_generation_unlocked(new_index)
+        self.index = new_index
         build_elapsed = time.time() - build_start
         minutes = int(build_elapsed // 60)
         seconds = int(build_elapsed % 60)
@@ -911,42 +1315,161 @@ class WritHerGraphRAG:
         )
         self._retrievers_dirty = False
 
-    def ask(self, question):
-        """Query the graph with read lock.
+    def _reload_if_storage_changed(self) -> None:
+        """Reload a newly committed storage revision before serving a query.
 
-        Uses a lock-upgrade pattern: acquire read to check state, release,
-        then acquire write only if retrievers need rebuilding, then read again for query.
+        The first manifest read is intentionally lock-free and treats a missing
+        manifest as an in-progress external build. A changed revision is then
+        confirmed while holding the local write lock followed by the canonical
+        inter-process lock, matching the writer lock order.
         """
-        self._rw_lock.acquire_read()
-        try:
-            if not self.index:
-                return "No index available. Add files to the knowledge_base folder."
-            needs_rebuild = self._retrievers_dirty
-        finally:
-            self._rw_lock.release_read()
+        persisted_revision = self._read_storage_revision_unlocked()
+        if (
+            persisted_revision is None
+            or persisted_revision == self._storage_revision
+        ):
+            return
 
-        if needs_rebuild:
+        self._rw_lock.acquire_write()
+        try:
+            with self._storage_lock():
+                self._recover_storage_unlocked()
+                persisted_revision = self._read_storage_revision_unlocked()
+                if (
+                    persisted_revision is None
+                    or persisted_revision == self._storage_revision
+                ):
+                    return
+                if not self._has_persisted_storage():
+                    self.index = None
+                    self._storage_revision = persisted_revision
+                else:
+                    try:
+                        self._load_index_unlocked()
+                    except EmbeddingModelMismatchError:
+                        raise
+                    except Exception as exc:
+                        raise PersistedIndexUnavailableError(
+                            "Updated knowledge-graph index could not be loaded."
+                        ) from exc
+                self._query_engine = None
+                self._retrievers_dirty = True
+        finally:
+            self._rw_lock.release_write()
+
+    def _no_index_result(self) -> str:
+        if not self._build_if_missing:
+            raise PersistedIndexUnavailableError(
+                "Persisted knowledge-graph index is not available."
+            )
+        return "No index available. Add files to the knowledge_base folder."
+
+    def ask_with_revision(self, question):
+        """Query a stable in-memory generation and return its storage revision."""
+        question = validate_question(question)
+        self._reload_if_storage_changed()
+
+        while True:
+            self._rw_lock.acquire_read()
+            try:
+                if not self.index:
+                    return self._no_index_result(), self._storage_revision
+                if not self._retrievers_dirty and self._query_engine is not None:
+                    response = self._query_engine.query(question)
+                    return response, self._storage_revision
+            finally:
+                self._rw_lock.release_read()
+
+            # A concurrent revision reload may invalidate retrievers between
+            # loop iterations. Recheck under the write lock, rebuild the
+            # current generation, then loop until query dispatch owns a read
+            # lock on a clean engine.
             self._rw_lock.acquire_write()
             try:
-                if self._retrievers_dirty:
+                if not self.index:
+                    return self._no_index_result(), self._storage_revision
+                if self._retrievers_dirty or self._query_engine is None:
                     self._build_retrievers()
             finally:
                 self._rw_lock.release_write()
 
-        self._rw_lock.acquire_read()
-        try:
-            if not self._query_engine:
-                return "No index available. Add files to the knowledge_base folder."
-            response = self._query_engine.query(question)
-            return response
-        finally:
-            self._rw_lock.release_read()
+    def _prepare_async_query_dispatch(self):
+        """Prepare one stable async dispatch while running in a worker thread.
+
+        A clean query engine is returned with the local read lock held. The
+        async caller owns releasing that lock after model I/O or cancellation.
+        """
+        self._reload_if_storage_changed()
+
+        while True:
+            keep_read_lock = False
+            self._rw_lock.acquire_read()
+            try:
+                if not self.index:
+                    return None, self._no_index_result(), self._storage_revision
+                if not self._retrievers_dirty and self._query_engine is not None:
+                    keep_read_lock = True
+                    return self._query_engine, None, self._storage_revision
+            finally:
+                if not keep_read_lock:
+                    self._rw_lock.release_read()
+
+            self._rw_lock.acquire_write()
+            try:
+                if not self.index:
+                    return None, self._no_index_result(), self._storage_revision
+                if self._retrievers_dirty or self._query_engine is None:
+                    self._build_retrievers()
+            finally:
+                self._rw_lock.release_write()
+
+    async def ask_with_revision_async(self, question):
+        """Asynchronously query one stable generation on the caller's event loop."""
+        question = validate_question(question)
+
+        # Cached Ollama clients must remain on Uvicorn's persistent event loop.
+        # Blocking storage and threading-lock work runs in a worker, while this
+        # lock serializes use of the cached async query engine.
+        async with self._async_query_lock:
+            prepare_task = asyncio.create_task(
+                asyncio.to_thread(self._prepare_async_query_dispatch)
+            )
+            try:
+                query_engine, no_index_result, revision = await asyncio.shield(
+                    prepare_task
+                )
+            except asyncio.CancelledError:
+                # asyncio.to_thread cannot stop an in-flight worker. Wait for
+                # preparation to finish and release any read lock it returned
+                # before propagating cancellation, preventing a leaked lock.
+                try:
+                    prepared = await prepare_task
+                except Exception:
+                    pass
+                else:
+                    if prepared[0] is not None:
+                        self._rw_lock.release_read()
+                raise
+
+            if query_engine is None:
+                return no_index_result, revision
+
+            try:
+                response = await query_engine.aquery(question)
+                return response, revision
+            finally:
+                self._rw_lock.release_read()
+
+    def ask(self, question):
+        """Validate, refresh persisted storage, and query a stable generation."""
+        response, _ = self.ask_with_revision(question)
+        return response
 
 
 # ==========================================
 # REAL-TIME FILE MONITORING (with persistent content-hash)
 # ==========================================
-_HASH_CACHE_FILE = os.path.join(STORAGE_DIR, ".file_hashes.json")
+_HASH_CACHE_FILE = HASH_CACHE_FILE
 
 
 def _file_content_hash(path: str) -> str | None:
@@ -959,30 +1482,24 @@ def _file_content_hash(path: str) -> str | None:
 
 
 def _load_hash_cache() -> dict[str, str]:
-    """Load hash cache from disk."""
-    import json
-
-    try:
-        if os.path.exists(_HASH_CACHE_FILE):
-            with open(_HASH_CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
+    """Load the hash cache while holding the cross-process storage lock."""
+    data = read_json_locked(
+        _HASH_CACHE_FILE,
+        STORAGE_LOCK_FILE,
+        STORAGE_LOCK_TIMEOUT,
+        default={},
+    )
+    return data if isinstance(data, dict) else {}
 
 
 def _save_hash_cache(hashes: dict[str, str]):
-    """Save hash cache to disk."""
-    import json
-
-    os.makedirs(os.path.dirname(_HASH_CACHE_FILE), exist_ok=True)
-    try:
-        with open(_HASH_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(hashes, f, indent=2)
-    except OSError:
-        pass
+    """Atomically save the hash cache under the cross-process storage lock."""
+    atomic_write_json_locked(
+        _HASH_CACHE_FILE,
+        hashes,
+        STORAGE_LOCK_FILE,
+        STORAGE_LOCK_TIMEOUT,
+    )
 
 
 class FileWatcher(FileSystemEventHandler):
@@ -991,7 +1508,6 @@ class FileWatcher(FileSystemEventHandler):
         self._lock = threading.Lock()
         self._pending_events: dict[str, tuple[str, float]] = {}
         self._timer = None
-        # Persistent hash cache on disk
         self._file_hashes: dict[str, str] = _load_hash_cache()
         self._refresh_hashes()
 
@@ -1005,16 +1521,15 @@ class FileWatcher(FileSystemEventHandler):
         for ext in WATCHER_VALID_EXTENSIONS:
             for f in kb_path.rglob(f"*{ext}"):
                 if ".obsidian" not in f.parts:
-                    fpath = str(f)
+                    fpath = str(f.resolve())
                     current_files.add(fpath)
-                    h = _file_content_hash(fpath)
-                    if h and fpath not in self._file_hashes:
-                        self._file_hashes[fpath] = h
+                    file_hash = _file_content_hash(fpath)
+                    if file_hash and fpath not in self._file_hashes:
+                        self._file_hashes[fpath] = file_hash
 
-        # Remove hashes for deleted files
-        stale = [k for k in self._file_hashes if k not in current_files]
-        for k in stale:
-            del self._file_hashes[k]
+        stale = [key for key in self._file_hashes if key not in current_files]
+        for key in stale:
+            del self._file_hashes[key]
 
         _save_hash_cache(self._file_hashes)
 
@@ -1024,23 +1539,57 @@ class FileWatcher(FileSystemEventHandler):
             return False
         return p.suffix.lower() in WATCHER_VALID_EXTENSIONS
 
-    def _has_content_changed(self, path: str) -> bool:
-        """Check if file content has actually changed compared to last hash."""
-        new_hash = _file_content_hash(path)
-        if new_hash is None:
-            return path in self._file_hashes
+    def _collect_changed_events(
+        self, events: dict[str, tuple[str, float]]
+    ) -> tuple[dict[str, tuple[str, float]], dict[str, str | None]]:
+        """Capture each changed source hash before indexing begins."""
+        changed_events: dict[str, tuple[str, float]] = {}
+        indexed_hashes: dict[str, str | None] = {}
+        for path, (event_type, timestamp) in events.items():
+            observed_hash = (
+                None if event_type == "deleted" else _file_content_hash(path)
+            )
+            if event_type == "deleted" or self._file_hashes.get(path) != observed_hash:
+                changed_events[path] = (event_type, timestamp)
+                indexed_hashes[path] = observed_hash
+        return changed_events, indexed_hashes
 
-        old_hash = self._file_hashes.get(path)
-        if old_hash == new_hash:
-            return False  # Identical content, phantom event
-
-        self._file_hashes[path] = new_hash
+    def _commit_hashes(
+        self,
+        events: dict[str, tuple[str, float]],
+        indexed_hashes: dict[str, str | None],
+    ) -> list[tuple[str, str]]:
+        """Checkpoint only stable source versions and return required retries."""
+        retry_events: list[tuple[str, str]] = []
+        for path in events:
+            indexed_hash = indexed_hashes[path]
+            current_hash = _file_content_hash(path)
+            if current_hash != indexed_hash:
+                # A source changed while it was being indexed. Never associate
+                # the newly observed bytes with the generation just published:
+                # a modification rebuild also removes triples from that stale
+                # intermediate version.
+                retry_type = "deleted" if current_hash is None else "modified"
+                retry_events.append((retry_type, path))
+                continue
+            if indexed_hash is None:
+                self._file_hashes.pop(path, None)
+            else:
+                self._file_hashes[path] = indexed_hash
         _save_hash_cache(self._file_hashes)
-        return True
+        return retry_events
 
     def _schedule_processing(self, event_type, path):
+        normalized_path = str(Path(path).resolve())
         with self._lock:
-            self._pending_events[path] = (event_type, time.time())
+            previous = self._pending_events.get(normalized_path)
+            if previous is not None:
+                previous_type, _ = previous
+                # Preserve the strongest event. In particular, delete→create is
+                # an atomic replacement and must still force a full rebuild.
+                if _WATCHER_EVENT_PRIORITY[previous_type] > _WATCHER_EVENT_PRIORITY[event_type]:
+                    event_type = previous_type
+            self._pending_events[normalized_path] = (event_type, time.time())
             if self._timer is not None:
                 self._timer.cancel()
             self._timer = threading.Timer(
@@ -1058,41 +1607,29 @@ class FileWatcher(FileSystemEventHandler):
         if not events:
             return
 
-        # Filter phantom events: verify content actually changed
-        real_events = {}
-        for path, (etype, ts) in events.items():
-            if etype == "deleted":
-                # Deletions are always real
-                self._file_hashes.pop(path, None)
-                real_events[path] = (etype, ts)
-            elif self._has_content_changed(path):
-                real_events[path] = (etype, ts)
-
+        real_events, indexed_hashes = self._collect_changed_events(events)
         if not real_events:
             safe_print("\n(Filesystem events ignored: no real content changes)")
             return
 
-        # Separate events by type
-        deleted = [p for p, (e, _) in real_events.items() if e == "deleted"]
-        modified = [p for p, (e, _) in real_events.items() if e == "modified"]
-        created = [p for p, (e, _) in real_events.items() if e == "created"]
+        deleted = [p for p, (event_type, _) in real_events.items() if event_type == "deleted"]
+        modified = [p for p, (event_type, _) in real_events.items() if event_type == "modified"]
+        created = [p for p, (event_type, _) in real_events.items() if event_type == "created"]
 
-        # Deletions require full rebuild (can't selectively remove all related triples)
-        if deleted:
-            safe_print(f"\nFile(s) deleted. Rebuilding graph...")
+        # Any modification/deletion gets one full rebuild so removed structural
+        # triples cannot survive. The same rebuild also includes batch creations.
+        if deleted or modified:
+            safe_print("\nFile modification/deletion detected. Rebuilding graph...")
             self.rag_system.build_index()
-            return
+        else:
+            for path in created:
+                if os.path.exists(path):
+                    safe_print(f"\nNew file detected: {os.path.basename(path)}.")
+                    self.rag_system.insert_document(path)
 
-        # Modifications: incremental update (delete + re-insert per file)
-        for path in modified:
-            if os.path.exists(path):
-                self.rag_system.update_document(path)
-
-        # Creations: incremental insert
-        for path in created:
-            if os.path.exists(path):
-                safe_print(f"\nNew file detected: {os.path.basename(path)}.")
-                self.rag_system.insert_document(path)
+        retry_events = self._commit_hashes(real_events, indexed_hashes)
+        for event_type, path in retry_events:
+            self._schedule_processing(event_type, path)
 
     def on_created(self, event):
         if not event.is_directory and self._is_relevant_file(event.src_path):
@@ -1110,8 +1647,13 @@ class FileWatcher(FileSystemEventHandler):
 # ==========================================
 # TERMINAL INTERFACE (Rich)
 # ==========================================
-def _check_ollama_available(model_name: str, embed_model: str):
-    """Verify Ollama is running and required models are available.
+def _check_ollama_available(
+    model_name: str,
+    embed_model: str,
+    base_url: str = OLLAMA_BASE_URL,
+    request_timeout: float = OLLAMA_TIMEOUT,
+):
+    """Verify the configured Ollama endpoint and required models are available.
 
     Prints clear error messages with suggested commands if something is missing.
     Returns True if everything is ready, False otherwise.
@@ -1119,12 +1661,10 @@ def _check_ollama_available(model_name: str, embed_model: str):
     import urllib.request
     import json as _json
 
-    base_url = "http://localhost:11434"
-
     # Check if Ollama is running
     try:
         req = urllib.request.Request(f"{base_url}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=request_timeout) as resp:
             data = _json.loads(resp.read().decode())
     except Exception:
         console.print(
@@ -1218,12 +1758,24 @@ def main():
         )
     )
 
-    with Status("[dim]Loading knowledge graph...[/dim]", console=console, spinner="dots"):
-        rag = WritHerGraphRAG(
-            fast_mode=args.fast,
-            model_name=llm_model,
-            embed_model=embed_model,
+    try:
+        with Status("[dim]Loading knowledge graph...[/dim]", console=console, spinner="dots"):
+            rag = WritHerGraphRAG(
+                fast_mode=args.fast,
+                model_name=llm_model,
+                embed_model=embed_model,
+            )
+    except EmbeddingModelMismatchError as exc:
+        console.print(
+            Panel(
+                f"[bold red]{exc}[/bold red]\n\n"
+                "Kwipu did not rebuild automatically because mixing embedding "
+                "models would invalidate the stored vectors.",
+                title="[red]Embedding Configuration Error[/red]",
+                border_style="red",
+            )
         )
+        return 2
 
     observer = Observer()
     observer.schedule(FileWatcher(rag), KNOWLEDGE_DIR, recursive=True)
@@ -1241,7 +1793,10 @@ def main():
             if query.lower().strip() in ["exit", "quit", "esci"]:
                 break
 
-            if not query.strip():
+            try:
+                query = validate_question(query)
+            except QueryValidationError as exc:
+                console.print(f"[yellow]{exc}[/yellow]")
                 continue
 
             with Status("[dim]Querying graph...[/dim]", console=console, spinner="dots"):
@@ -1270,4 +1825,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

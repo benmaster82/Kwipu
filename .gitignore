@@ -1,5 +1,15 @@
+# Local environment and generated reviews
+.env
+.env.*
+!.env.example
+/semantic-review/
+
 # Storage (generated graph index)
 storage_graph/
+/.storage_graph.staging/
+/.storage_graph.backup/
+/.storage_graph.lock
+/.storage_graph.lock.recovery
 
 # Python
 __pycache__/
