@@ -366,7 +366,7 @@ class ExpandNodeTests(unittest.TestCase):
                     result = graph.expand_node("chunk")
 
                 reader_class.assert_called_once_with(
-                    input_files=[str(source)], filename_as_id=True
+                    input_files=[str(source.resolve())], filename_as_id=True
                 )
                 self.assertEqual(result["markdown"], "First\n\nSecond")
 

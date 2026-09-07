@@ -33,6 +33,7 @@ class StoragePathValidationTests(unittest.TestCase):
     def test_returns_disjoint_sibling_generation_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            canonical_root = root.resolve()
             current, staging, backup = kwipu_config.validate_storage_layout(
                 root / "vault", root / "storage"
             )
@@ -40,7 +41,9 @@ class StoragePathValidationTests(unittest.TestCase):
         self.assertEqual(current.name, "storage")
         self.assertEqual(staging.name, ".storage.staging")
         self.assertEqual(backup.name, ".storage.backup")
-        self.assertEqual({current.parent, staging.parent, backup.parent}, {root})
+        self.assertEqual(
+            {current.parent, staging.parent, backup.parent}, {canonical_root}
+        )
 
     def test_runtime_validation_precedes_first_mkdir(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -774,7 +777,7 @@ class RagStorageLifecycleTests(unittest.TestCase):
             manifest = json.loads(
                 (current / ".kwipu_meta.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(persist_dir, staging)
+            self.assertEqual(persist_dir, staging.resolve(strict=False))
             self.assertEqual(
                 (current / "index.json").read_text(encoding="utf-8"),
                 "new-index",

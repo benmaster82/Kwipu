@@ -53,14 +53,19 @@ Kwipu turns a folder of documents into a property-graph RAG index that you can e
 
 ![Kwipu comparing project roles with citations](img/second%20brain_3.jpeg)
 
-<details>
-<summary>Terminal and Obsidian examples</summary>
+## Terminal interface
 
-![Kwipu terminal answering from an Obsidian project note](img/screen.png)
+Use Kwipu directly from the command line while keeping your notes open in Obsidian. The terminal returns grounded answers from the graph and continues watching the knowledge folder for changes.
 
-![Kwipu rebuilding after an Obsidian meeting-note update](img/screen_2.png)
+### Ask about roles, tasks, and project context
 
-</details>
+![Kwipu terminal answering a question about Alice's role and tasks from an Obsidian Project Alpha note](img/screen.png)
+
+### Query meeting decisions and rebuild after note changes
+
+![Kwipu terminal extracting decisions and responsibilities before rebuilding the graph after an Obsidian meeting-note update](img/screen_2.png)
+
+For installation and commands, see [Terminal-only use](#terminal-only-use).
 
 ## Choose cloud or local
 
