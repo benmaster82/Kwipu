@@ -6,5 +6,5 @@ watchdog==6.0.0
 nest-asyncio==1.6.0
 PyYAML==6.0.3
 rich==14.1.0
-mcp==1.27.1
+mcp==1.30.0
 python-docx==1.2.0
